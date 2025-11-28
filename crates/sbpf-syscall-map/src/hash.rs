@@ -64,5 +64,7 @@ mod tests {
         // These should remain constant across runs
         assert_eq!(murmur3_32("abort"), ABORT_HASH);
         assert_eq!(murmur3_32("sol_log_"), SOL_LOG_HASH);
+
+
     }
 }

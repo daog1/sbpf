@@ -126,7 +126,8 @@ impl AST {
         // 1. resolve labels in the intruction nodes for lddw and jump
         // 2. find relocation information
 
-        let program_is_static = !self.nodes.iter().any(|node| matches!(node, ASTNode::Instruction { instruction: inst, .. } if inst.needs_relocation()));
+        // Solana/BPF loader expects loadable segments and dynamic sections, always generate ELF with program headers
+        let program_is_static = false;
         let mut relocations = RelDynMap::new();
         let mut dynamic_symbols = DynamicSymbolMap::new();
 
