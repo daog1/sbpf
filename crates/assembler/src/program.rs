@@ -32,13 +32,16 @@ impl Program {
         let mut elf_header = ElfHeader::new();
         let mut program_headers = None;
 
+        let code_size = code_section.size();
+        let data_size = data_section.size();
+
         // omit program headers if static
         let ph_count = if prog_is_static { 0 } else { 3 };
         elf_header.e_phnum = ph_count;
 
         // save read + execute size for program header before
         // ownership of code/data sections is transferred
-        let text_size = code_section.size() + data_section.size();
+        let text_size = code_size + data_size;
 
         // Calculate base offset after ELF header and program headers
         let mut current_offset = 64 + (ph_count as u64 * 56); // 64 bytes ELF header, 56 bytes per program header
@@ -77,41 +80,91 @@ impl Program {
             dyn_syms.push(DynamicSymbol::new(0, 0, 0, 0, 0, 0));
 
             // all symbols handled right now are all global symbols
-            for (name, _) in dynamic_symbols.get_entry_points() {
+            for (name, offset) in dynamic_symbols.get_entry_points() {
+                if symbol_names.contains(&name) {
+                    continue;
+                }
                 symbol_names.push(name.clone());
                 dyn_syms.push(DynamicSymbol::new(
                     dyn_str_offset as u32,
-                    0x10,
+                    0x12, // STB_GLOBAL | STT_FUNC
                     0,
                     1,
-                    elf_header.e_entry,
-                    0,
+                    elf_header.e_entry + offset,
+                    code_size.saturating_sub(offset),
                 ));
                 dyn_str_offset += name.len() + 1;
             }
 
             for (name, _) in dynamic_symbols.get_call_targets() {
+                if symbol_names.contains(&name) {
+                    continue;
+                }
                 symbol_names.push(name.clone());
-                dyn_syms.push(DynamicSymbol::new(dyn_str_offset as u32, 0x10, 0, 0, 0, 0));
+                dyn_syms.push(DynamicSymbol::new(
+                    dyn_str_offset as u32,
+                    0x10, // STB_GLOBAL | STT_NOTYPE
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
                 dyn_str_offset += name.len() + 1;
+            }
+
+            // Ensure all syscall names also appear in dynsym/dynstr (even if not recorded in dynamic_symbols)
+            for (_, rel_type, name) in relocation_data.get_rel_dyns() {
+                if rel_type == RelocationType::RSbfSyscall && !symbol_names.contains(&name) {
+                    symbol_names.push(name.clone());
+                    dyn_syms.push(DynamicSymbol::new(
+                        dyn_str_offset as u32,
+                        0x10,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ));
+                    dyn_str_offset += name.len() + 1;
+                }
+            }
+
+            // Ensure entry symbol exists
+            if !symbol_names.contains(&"entrypoint".to_string()) {
+                symbol_names.push("entrypoint".to_string());
+                dyn_syms.push(DynamicSymbol::new(
+                    dyn_str_offset as u32,
+                    0x12,
+                    0,
+                    1,
+                    elf_header.e_entry,
+                    code_size,
+                ));
+                dyn_str_offset += "entrypoint".len() + 1;
             }
 
             let mut rel_count = 0;
             let mut rel_dyns = Vec::new();
             for (offset, rel_type, name) in relocation_data.get_rel_dyns() {
-                if rel_type == RelocationType::RSbfSyscall {
-                    if let Some(index) = symbol_names.iter().position(|n| *n == name) {
+                match rel_type {
+                    RelocationType::RSbfSyscall => {
+                        if let Some(index) = symbol_names.iter().position(|n| *n == name) {
+                            rel_dyns.push(RelDyn::new(
+                                offset + elf_header.e_entry,
+                                rel_type as u64,
+                                index as u64 + 1,
+                            ));
+                        } else {
+                            panic!("Symbol {} not found in symbol_names", name);
+                        }
+                    }
+                    RelocationType::RSbf64Relative => {
+                        rel_count += 1;
                         rel_dyns.push(RelDyn::new(
                             offset + elf_header.e_entry,
                             rel_type as u64,
-                            index as u64 + 1,
+                            0,
                         ));
-                    } else {
-                        panic!("Symbol {} not found in symbol_names", name);
                     }
-                } else if rel_type == RelocationType::RSbf64Relative {
-                    rel_count += 1;
-                    rel_dyns.push(RelDyn::new(offset + elf_header.e_entry, rel_type as u64, 0));
                 }
             }
             // create four dynamic related sections
@@ -164,6 +217,7 @@ impl Program {
                         .expect("missing .dynstr section") as u32
                         + 1,
                 );
+                // rel_count only counts R_RELATIVE (does not include syscall)
                 dynamic_section.set_rel_count(rel_count);
             }
             current_offset += dynamic_section.size();
@@ -198,8 +252,14 @@ impl Program {
             current_offset += rel_dyn_section.size();
 
             if let SectionType::Dynamic(ref mut dynamic_section) = dynamic_section {
-                dynamic_section.set_rel_offset(rel_dyn_section.offset());
-                dynamic_section.set_rel_size(rel_dyn_section.size());
+                let has_relocs = rel_dyn_section.size() > 0;
+                if has_relocs {
+                    dynamic_section.set_rel_offset(rel_dyn_section.offset());
+                    dynamic_section.set_rel_size(rel_dyn_section.size());
+                } else {
+                    dynamic_section.set_rel_offset(0);
+                    dynamic_section.set_rel_size(0);
+                }
                 dynamic_section.set_dynsym_offset(dynsym_section.offset());
                 dynamic_section.set_dynstr_offset(dynstr_section.offset());
                 dynamic_section.set_dynstr_size(dynstr_section.size());
