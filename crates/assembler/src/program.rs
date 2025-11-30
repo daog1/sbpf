@@ -27,6 +27,7 @@ impl Program {
             dynamic_symbols,
             relocation_data,
             prog_is_static,
+            entry_address,
         }: ParseResult,
     ) -> Self {
         let mut elf_header = ElfHeader::new();
@@ -45,7 +46,7 @@ impl Program {
 
         // Calculate base offset after ELF header and program headers
         let mut current_offset = 64 + (ph_count as u64 * 56); // 64 bytes ELF header, 56 bytes per program header
-        elf_header.e_entry = current_offset;
+        elf_header.e_entry = current_offset + entry_address;
 
         // Create a vector of sections
         let mut sections = Vec::new();

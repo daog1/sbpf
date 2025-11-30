@@ -126,8 +126,8 @@ impl AST {
         // 1. resolve labels in the intruction nodes for lddw and jump
         // 2. find relocation information
 
-        // Solana/BPF loader expects loadable segments and dynamic sections, always generate ELF with program headers
-        let program_is_static = false;
+        // Determine if program is static based on whether it has dynamic symbols
+        let mut program_is_static = true;
         let mut relocations = RelDynMap::new();
         let mut dynamic_symbols = DynamicSymbolMap::new();
 
@@ -204,6 +204,9 @@ impl AST {
             dynamic_symbols.add_entry_point(entry_label.clone(), *offset);
         }
 
+        // Determine if program is static based on whether it has dynamic symbols
+        let prog_is_static = dynamic_symbols.get_entry_points().is_empty() && dynamic_symbols.get_call_targets().is_empty();
+
         if !errors.is_empty() {
             Err(errors)
         } else {
@@ -215,7 +218,8 @@ impl AST {
                 ),
                 dynamic_symbols,
                 relocation_data: relocations,
-                prog_is_static: program_is_static,
+                prog_is_static,
+                entry_address: 0, // Will be set in parse_bytecode if needed
             })
         }
     }
