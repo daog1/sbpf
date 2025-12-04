@@ -9,6 +9,10 @@ use {
     std::collections::HashMap,
 };
 
+fn align_to_eight(len: u64) -> u64 {
+    (len + 7) & !7
+}
+
 // Base Section trait
 pub trait Section {
     fn name(&self) -> &str {
@@ -164,7 +168,7 @@ impl DataSection {
             flags,
             self.offset,
             self.offset,
-            self.size,
+            self.size(),
             0,
             0,
             1,
@@ -180,7 +184,7 @@ impl Section for DataSection {
     }
 
     fn size(&self) -> u64 {
-        self.size
+        align_to_eight(self.size)
     }
 
     fn bytecode(&self) -> Vec<u8> {
@@ -289,22 +293,21 @@ impl Section for ShStrTabSection {
     }
 
     fn size(&self) -> u64 {
-        // Calculate section header offset
-        let mut section_name_size = 0;
+        let mut section_name_size = 0_u64;
 
         for name in &self.section_names {
             if !name.is_empty() {
-                section_name_size += 1 + name.len();
+                section_name_size += 1 + name.len() as u64;
             }
         }
 
         section_name_size += 1; // null section
 
-        section_name_size as u64 // Return the calculated size
+        align_to_eight(section_name_size)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynamicSection {
     name: String,
     name_offset: u32,
@@ -364,6 +367,25 @@ impl DynamicSection {
 
     pub fn set_dynstr_size(&mut self, size: u64) {
         self.dynstr_size = size;
+    }
+
+    pub fn bytecode_overridden(
+        &self,
+        rel_offset: u64,
+        rel_size: u64,
+        rel_count: u64,
+        dynsym_offset: u64,
+        dynstr_offset: u64,
+        dynstr_size: u64,
+    ) -> Vec<u8> {
+        let mut clone = self.clone();
+        clone.rel_offset = rel_offset;
+        clone.rel_size = rel_size;
+        clone.rel_count = rel_count;
+        clone.dynsym_offset = dynsym_offset;
+        clone.dynstr_offset = dynstr_offset;
+        clone.dynstr_size = dynstr_size;
+        clone.bytecode()
     }
 
     pub fn section_header_bytecode(&self) -> Vec<u8> {
@@ -716,6 +738,98 @@ impl SectionType {
             SectionType::DynSym(ds) => ds.section_header_bytecode(),
             SectionType::Default(ds) => ds.section_header_bytecode(),
             SectionType::RelDyn(ds) => ds.section_header_bytecode(),
+        }
+    }
+
+    pub fn section_header(&self, offset: u64, size: u64) -> SectionHeader {
+        match self {
+            SectionType::Code(_) => SectionHeader::new(
+                1,
+                SectionHeader::SHT_PROGBITS,
+                SectionHeader::SHF_ALLOC | SectionHeader::SHF_EXECINSTR,
+                offset,
+                offset,
+                size,
+                0,
+                0,
+                4,
+                0,
+            ),
+            SectionType::Data(_) => SectionHeader::new(
+                7,
+                SectionHeader::SHT_PROGBITS,
+                SectionHeader::SHF_ALLOC,
+                offset,
+                offset,
+                size,
+                0,
+                0,
+                1,
+                0,
+            ),
+            SectionType::ShStrTab(ss) => SectionHeader::new(
+                ss.name_offset,
+                SectionHeader::SHT_STRTAB,
+                0,
+                0,
+                offset,
+                size,
+                0,
+                0,
+                1,
+                0,
+            ),
+            SectionType::Dynamic(ds) => SectionHeader::new(
+                ds.name_offset,
+                SectionHeader::SHT_DYNAMIC,
+                SectionHeader::SHF_ALLOC | SectionHeader::SHF_WRITE,
+                offset,
+                offset,
+                size,
+                ds.link,
+                0,
+                8,
+                16,
+            ),
+            SectionType::DynStr(ds) => SectionHeader::new(
+                ds.name_offset,
+                SectionHeader::SHT_STRTAB,
+                SectionHeader::SHF_ALLOC,
+                offset,
+                offset,
+                size,
+                0,
+                0,
+                1,
+                0,
+            ),
+            SectionType::DynSym(ds) => SectionHeader::new(
+                ds.name_offset,
+                SectionHeader::SHT_DYNSYM,
+                SectionHeader::SHF_ALLOC,
+                offset,
+                offset,
+                size,
+                ds.link,
+                1,
+                8,
+                24,
+            ),
+            SectionType::Default(_) => {
+                SectionHeader::new(0, SectionHeader::SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+            }
+            SectionType::RelDyn(ds) => SectionHeader::new(
+                ds.name_offset,
+                SectionHeader::SHT_REL,
+                SectionHeader::SHF_ALLOC,
+                offset,
+                offset,
+                size,
+                ds.link,
+                0,
+                8,
+                16,
+            ),
         }
     }
 

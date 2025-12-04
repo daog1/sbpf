@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ElfHeader {
     pub e_ident: [u8; 16], // ELF identification bytes = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     pub e_type: u16,       // Object file type = 3 (ET_DYN)
@@ -16,7 +16,7 @@ pub struct ElfHeader {
     pub e_shstrndx: u16,   // Section name string table index
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ProgramHeader {
     pub p_type: u32,   // Type of segment
     pub p_flags: u32,  // Segment attributes

@@ -119,6 +119,7 @@ impl AST {
 
         for node in &self.rodata_nodes {
             if let ASTNode::ROData { rodata, offset } = node {
+                eprintln!("label_offset_map rodata {:?} {}", rodata.name, offset);
                 label_offset_map.insert(rodata.name.clone(), *offset + self.text_size);
             }
         }
@@ -172,6 +173,7 @@ impl AST {
                 if inst.needs_relocation() {
                     let (reloc_type, label) = get_relocation_info(inst);
                     relocations.add_rel_dyn(*offset, reloc_type, label.clone());
+                    eprintln!("needs_relocation {:?} {} {}", reloc_type, label, offset);
                     if reloc_type == RelocationType::RSbfSyscall {
                         dynamic_symbols.add_call_target(label.clone(), *offset);
                     }
@@ -210,6 +212,12 @@ impl AST {
         if !errors.is_empty() {
             Err(errors)
         } else {
+            eprintln!(
+                "self.rodata_nodes {:?} {}",
+                self.rodata_nodes, self.rodata_size
+            );
+            eprintln!("dynamic_symbols {:?}", dynamic_symbols);
+            eprintln!("relocations {:?}", relocations);
             Ok(ParseResult {
                 code_section: CodeSection::new(std::mem::take(&mut self.nodes), self.text_size),
                 data_section: DataSection::new(
@@ -218,8 +226,8 @@ impl AST {
                 ),
                 dynamic_symbols,
                 relocation_data: relocations,
-                prog_is_static,
-                entry_address: 0, // Will be set in parse_bytecode if needed
+                prog_is_static: program_is_static,
+                entry_address: 0,
             })
         }
     }

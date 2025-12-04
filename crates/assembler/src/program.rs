@@ -20,6 +20,10 @@ pub struct Program {
 }
 
 impl Program {
+    fn align_to_eight(len: u64) -> u64 {
+        (len + 7) & !7
+    }
+
     pub fn from_parse_result(
         ParseResult {
             code_section,
@@ -46,7 +50,9 @@ impl Program {
 
         // Calculate base offset after ELF header and program headers
         let mut current_offset = 64 + (ph_count as u64 * 56); // 64 bytes ELF header, 56 bytes per program header
+        //elf_header.e_entry = current_offset;
         elf_header.e_entry = current_offset + entry_address;
+        let code_offset = current_offset;
 
         // Create a vector of sections
         let mut sections = Vec::new();
@@ -91,8 +97,8 @@ impl Program {
                     0x12, // STB_GLOBAL | STT_FUNC
                     0,
                     1,
-                    elf_header.e_entry + offset,
-                    code_size.saturating_sub(offset),
+                    code_offset,
+                    0,
                 ));
                 dyn_str_offset += name.len() + 1;
             }
@@ -161,7 +167,7 @@ impl Program {
                     RelocationType::RSbf64Relative => {
                         rel_count += 1;
                         rel_dyns.push(RelDyn::new(
-                            offset + elf_header.e_entry,
+                            offset + code_offset,
                             rel_type as u64,
                             0,
                         ));
@@ -265,6 +271,7 @@ impl Program {
                 dynamic_section.set_dynstr_offset(dynstr_section.offset());
                 dynamic_section.set_dynstr_size(dynstr_section.size());
             }
+            eprintln!("section_names {:?}", section_names);
 
             let mut shstrtab_section = SectionType::ShStrTab(ShStrTabSection::new(
                 (section_names
@@ -330,25 +337,137 @@ impl Program {
 
     pub fn emit_bytecode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        let mut elf_header = self.elf_header;
+        let mut header_bytes = elf_header.bytecode();
+        bytes.extend_from_slice(&header_bytes);
 
-        // Emit ELF Header bytes
-        bytes.extend(self.elf_header.bytecode());
+        // Reserve space for program headers; we'll fill the real values later.
+        let ph_entry_size = elf_header.e_phentsize as usize;
+        let ph_count = self
+            .program_headers
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let ph_bytes_len = ph_entry_size * ph_count;
+        bytes.extend(std::iter::repeat(0u8).take(ph_bytes_len));
 
-        // Emit program headers
-        if self.program_headers.is_some() {
-            for ph in self.program_headers.as_ref().unwrap() {
-                bytes.extend(ph.bytecode());
+        // Emit sections and capture their headers with the real offsets/sizes
+        let mut section_headers = Vec::new();
+        let mut shstr_index = 0usize;
+        let mut section_info = Vec::new();
+        for (idx, section) in self.sections.iter().enumerate() {
+            let offset = bytes.len() as u64;
+            let data = section.bytecode();
+            let size = data.len() as u64;
+            bytes.extend(data);
+
+            if matches!(section, SectionType::ShStrTab(_)) {
+                shstr_index = idx;
+            }
+            section_info.push((section.name().to_string(), offset, size));
+            section_headers.push(section.section_header(offset, size).bytecode());
+        }
+
+        // Align to 8 bytes before section headers
+        let shoff = Self::align_to_eight(bytes.len() as u64);
+        while bytes.len() as u64 % 8 != 0 {
+            bytes.push(0);
+        }
+
+        // Fill in the final ELF header values now that we know section header placement.
+        elf_header.e_shoff = shoff;
+        elf_header.e_shnum = self.sections.len() as u16;
+        elf_header.e_shstrndx = shstr_index as u16;
+        header_bytes = elf_header.bytecode();
+        bytes[0..header_bytes.len()].copy_from_slice(&header_bytes);
+
+        // Patch dynamic section contents with the recomputed offsets
+        let rel_dyn_info = section_info.iter().find(|(n, _, _)| n == ".rel.dyn");
+        let dynsym_info = section_info.iter().find(|(n, _, _)| n == ".dynsym");
+        let dynstr_info = section_info.iter().find(|(n, _, _)| n == ".dynstr");
+        if let (
+            Some((_, rel_off, rel_size)),
+            Some((_, sym_off, _)),
+            Some((_, str_off, str_size)),
+        ) = (rel_dyn_info, dynsym_info, dynstr_info)
+        {
+            if let Some((_, dyn_offset, _)) =
+                section_info.iter().find(|(n, _, _)| n == ".dynamic")
+            {
+                if let Some(SectionType::Dynamic(ds)) =
+                    self.sections.iter().find(|s| matches!(s, SectionType::Dynamic(_)))
+                {
+                    let rel_count = rel_size / 16;
+                    let dyn_bytes = ds.bytecode_overridden(
+                        *rel_off,
+                        *rel_size,
+                        rel_count,
+                        *sym_off,
+                        *str_off,
+                        *str_size,
+                    );
+                    let start = *dyn_offset as usize;
+                    let end = start + dyn_bytes.len();
+                    bytes[start..end].copy_from_slice(&dyn_bytes);
+                }
             }
         }
 
-        // Emit sections
-        for section in &self.sections {
-            bytes.extend(section.bytecode());
+        // Rebuild program headers to match actual offsets
+        if ph_count > 0 {
+            let mut ph_real = Vec::new();
+            let text = section_info.iter().find(|(n, _, _)| n == ".text");
+            let rodata = section_info.iter().find(|(n, _, _)| n == ".rodata");
+            if let Some((_, text_off, text_size)) = text {
+                let text_region_end = if let Some((_, ro_off, ro_size)) = rodata {
+                    ro_off + ro_size
+                } else {
+                    text_off + text_size
+                };
+                ph_real.push(ProgramHeader::new_load(
+                    *text_off,
+                    text_region_end - text_off,
+                    true,
+                ));
+            }
+
+            let dynsym = section_info.iter().find(|(n, _, _)| n == ".dynsym");
+            let dynstr = section_info.iter().find(|(n, _, _)| n == ".dynstr");
+            let rel_dyn = section_info.iter().find(|(n, _, _)| n == ".rel.dyn");
+            if let (Some((_, sym_off, sym_size)), Some((_, str_off, str_size)), Some((_, rel_off, rel_size))) =
+                (dynsym, dynstr, rel_dyn)
+            {
+                let start = *sym_off;
+                let end = rel_off + rel_size;
+                ph_real.push(ProgramHeader::new_load(
+                    start,
+                    end - start,
+                    false,
+                ));
+            }
+
+            if let Some((_, dyn_off, dyn_size)) =
+                section_info.iter().find(|(n, _, _)| n == ".dynamic")
+            {
+                ph_real.push(ProgramHeader::new_dynamic(*dyn_off, *dyn_size));
+            }
+
+            let mut ph_bytes = Vec::new();
+            for ph in &ph_real {
+                ph_bytes.extend(ph.bytecode());
+            }
+            let ph_slice_end = header_bytes.len() + ph_bytes.len();
+            bytes[header_bytes.len()..ph_slice_end].copy_from_slice(&ph_bytes);
+
+            // update phnum to the recomputed set
+            elf_header.e_phnum = ph_real.len() as u16;
+            header_bytes = elf_header.bytecode();
+            bytes[0..header_bytes.len()].copy_from_slice(&header_bytes);
         }
 
         // Emit section headers
-        for section in &self.sections {
-            bytes.extend(section.section_header_bytecode());
+        for header in section_headers {
+            bytes.extend(header);
         }
 
         bytes

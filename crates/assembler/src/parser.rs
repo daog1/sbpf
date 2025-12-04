@@ -46,8 +46,6 @@ pub struct ParseResult {
     // TODO: this can be removed and dynamic-ness should just be
     // determined by if there's any dynamic symbol
     pub prog_is_static: bool,
-
-    // Entry point address from ELF symbols
     pub entry_address: u64,
 }
 
