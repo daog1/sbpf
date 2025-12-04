@@ -127,8 +127,7 @@ impl AST {
         // 1. resolve labels in the intruction nodes for lddw and jump
         // 2. find relocation information
 
-        // Determine if program is static based on whether it has dynamic symbols
-        let mut program_is_static = true;
+        let program_is_static = !self.nodes.iter().any(|node| matches!(node, ASTNode::Instruction { instruction: inst, .. } if inst.needs_relocation()));
         let mut relocations = RelDynMap::new();
         let mut dynamic_symbols = DynamicSymbolMap::new();
 
@@ -205,9 +204,6 @@ impl AST {
         {
             dynamic_symbols.add_entry_point(entry_label.clone(), *offset);
         }
-
-        // Determine if program is static based on whether it has dynamic symbols
-        let prog_is_static = dynamic_symbols.get_entry_points().is_empty() && dynamic_symbols.get_call_targets().is_empty();
 
         if !errors.is_empty() {
             Err(errors)

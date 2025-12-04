@@ -37,16 +37,13 @@ impl Program {
         let mut elf_header = ElfHeader::new();
         let mut program_headers = None;
 
-        let code_size = code_section.size();
-        let data_size = data_section.size();
-
         // omit program headers if static
         let ph_count = if prog_is_static { 0 } else { 3 };
         elf_header.e_phnum = ph_count;
 
         // save read + execute size for program header before
         // ownership of code/data sections is transferred
-        let text_size = code_size + data_size;
+        let text_size = code_section.size() + data_section.size();
 
         // Calculate base offset after ELF header and program headers
         let mut current_offset = 64 + (ph_count as u64 * 56); // 64 bytes ELF header, 56 bytes per program header
@@ -87,14 +84,11 @@ impl Program {
             dyn_syms.push(DynamicSymbol::new(0, 0, 0, 0, 0, 0));
 
             // all symbols handled right now are all global symbols
-            for (name, offset) in dynamic_symbols.get_entry_points() {
-                if symbol_names.contains(&name) {
-                    continue;
-                }
+            for (name, _) in dynamic_symbols.get_entry_points() {
                 symbol_names.push(name.clone());
                 dyn_syms.push(DynamicSymbol::new(
                     dyn_str_offset as u32,
-                    0x12, // STB_GLOBAL | STT_FUNC
+                    0x10,
                     0,
                     1,
                     code_offset,
@@ -104,74 +98,27 @@ impl Program {
             }
 
             for (name, _) in dynamic_symbols.get_call_targets() {
-                if symbol_names.contains(&name) {
-                    continue;
-                }
                 symbol_names.push(name.clone());
-                dyn_syms.push(DynamicSymbol::new(
-                    dyn_str_offset as u32,
-                    0x10, // STB_GLOBAL | STT_NOTYPE
-                    0,
-                    0,
-                    0,
-                    0,
-                ));
+                dyn_syms.push(DynamicSymbol::new(dyn_str_offset as u32, 0x10, 0, 0, 0, 0));
                 dyn_str_offset += name.len() + 1;
-            }
-
-            // Ensure all syscall names also appear in dynsym/dynstr (even if not recorded in dynamic_symbols)
-            for (_, rel_type, name) in relocation_data.get_rel_dyns() {
-                if rel_type == RelocationType::RSbfSyscall && !symbol_names.contains(&name) {
-                    symbol_names.push(name.clone());
-                    dyn_syms.push(DynamicSymbol::new(
-                        dyn_str_offset as u32,
-                        0x10,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ));
-                    dyn_str_offset += name.len() + 1;
-                }
-            }
-
-            // Ensure entry symbol exists
-            if !symbol_names.contains(&"entrypoint".to_string()) {
-                symbol_names.push("entrypoint".to_string());
-                dyn_syms.push(DynamicSymbol::new(
-                    dyn_str_offset as u32,
-                    0x12,
-                    0,
-                    1,
-                    elf_header.e_entry,
-                    code_size,
-                ));
-                dyn_str_offset += "entrypoint".len() + 1;
             }
 
             let mut rel_count = 0;
             let mut rel_dyns = Vec::new();
             for (offset, rel_type, name) in relocation_data.get_rel_dyns() {
-                match rel_type {
-                    RelocationType::RSbfSyscall => {
-                        if let Some(index) = symbol_names.iter().position(|n| *n == name) {
-                            rel_dyns.push(RelDyn::new(
-                                offset + elf_header.e_entry,
-                                rel_type as u64,
-                                index as u64 + 1,
-                            ));
-                        } else {
-                            panic!("Symbol {} not found in symbol_names", name);
-                        }
-                    }
-                    RelocationType::RSbf64Relative => {
-                        rel_count += 1;
+                if rel_type == RelocationType::RSbfSyscall {
+                    if let Some(index) = symbol_names.iter().position(|n| *n == name) {
                         rel_dyns.push(RelDyn::new(
                             offset + code_offset,
                             rel_type as u64,
-                            0,
+                            index as u64 + 1,
                         ));
+                    } else {
+                        panic!("Symbol {} not found in symbol_names", name);
                     }
+                } else if rel_type == RelocationType::RSbf64Relative {
+                    rel_count += 1;
+                    rel_dyns.push(RelDyn::new(offset + code_offset, rel_type as u64, 0));
                 }
             }
             // create four dynamic related sections
@@ -224,7 +171,6 @@ impl Program {
                         .expect("missing .dynstr section") as u32
                         + 1,
                 );
-                // rel_count only counts R_RELATIVE (does not include syscall)
                 dynamic_section.set_rel_count(rel_count);
             }
             current_offset += dynamic_section.size();
@@ -259,14 +205,8 @@ impl Program {
             current_offset += rel_dyn_section.size();
 
             if let SectionType::Dynamic(ref mut dynamic_section) = dynamic_section {
-                let has_relocs = rel_dyn_section.size() > 0;
-                if has_relocs {
-                    dynamic_section.set_rel_offset(rel_dyn_section.offset());
-                    dynamic_section.set_rel_size(rel_dyn_section.size());
-                } else {
-                    dynamic_section.set_rel_offset(0);
-                    dynamic_section.set_rel_size(0);
-                }
+                dynamic_section.set_rel_offset(rel_dyn_section.offset());
+                dynamic_section.set_rel_size(rel_dyn_section.size());
                 dynamic_section.set_dynsym_offset(dynsym_section.offset());
                 dynamic_section.set_dynstr_offset(dynstr_section.offset());
                 dynamic_section.set_dynstr_size(dynstr_section.size());
@@ -343,11 +283,7 @@ impl Program {
 
         // Reserve space for program headers; we'll fill the real values later.
         let ph_entry_size = elf_header.e_phentsize as usize;
-        let ph_count = self
-            .program_headers
-            .as_ref()
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let ph_count = self.program_headers.as_ref().map(|v| v.len()).unwrap_or(0);
         let ph_bytes_len = ph_entry_size * ph_count;
         bytes.extend(std::iter::repeat(0u8).take(ph_bytes_len));
 
@@ -385,26 +321,19 @@ impl Program {
         let rel_dyn_info = section_info.iter().find(|(n, _, _)| n == ".rel.dyn");
         let dynsym_info = section_info.iter().find(|(n, _, _)| n == ".dynsym");
         let dynstr_info = section_info.iter().find(|(n, _, _)| n == ".dynstr");
-        if let (
-            Some((_, rel_off, rel_size)),
-            Some((_, sym_off, _)),
-            Some((_, str_off, str_size)),
-        ) = (rel_dyn_info, dynsym_info, dynstr_info)
+        if let (Some((_, rel_off, rel_size)), Some((_, sym_off, _)), Some((_, str_off, str_size))) =
+            (rel_dyn_info, dynsym_info, dynstr_info)
         {
-            if let Some((_, dyn_offset, _)) =
-                section_info.iter().find(|(n, _, _)| n == ".dynamic")
+            if let Some((_, dyn_offset, _)) = section_info.iter().find(|(n, _, _)| n == ".dynamic")
             {
-                if let Some(SectionType::Dynamic(ds)) =
-                    self.sections.iter().find(|s| matches!(s, SectionType::Dynamic(_)))
+                if let Some(SectionType::Dynamic(ds)) = self
+                    .sections
+                    .iter()
+                    .find(|s| matches!(s, SectionType::Dynamic(_)))
                 {
                     let rel_count = rel_size / 16;
                     let dyn_bytes = ds.bytecode_overridden(
-                        *rel_off,
-                        *rel_size,
-                        rel_count,
-                        *sym_off,
-                        *str_off,
-                        *str_size,
+                        *rel_off, *rel_size, rel_count, *sym_off, *str_off, *str_size,
                     );
                     let start = *dyn_offset as usize;
                     let end = start + dyn_bytes.len();
@@ -434,16 +363,15 @@ impl Program {
             let dynsym = section_info.iter().find(|(n, _, _)| n == ".dynsym");
             let dynstr = section_info.iter().find(|(n, _, _)| n == ".dynstr");
             let rel_dyn = section_info.iter().find(|(n, _, _)| n == ".rel.dyn");
-            if let (Some((_, sym_off, sym_size)), Some((_, str_off, str_size)), Some((_, rel_off, rel_size))) =
-                (dynsym, dynstr, rel_dyn)
+            if let (
+                Some((_, sym_off, sym_size)),
+                Some((_, str_off, str_size)),
+                Some((_, rel_off, rel_size)),
+            ) = (dynsym, dynstr, rel_dyn)
             {
                 let start = *sym_off;
                 let end = rel_off + rel_size;
-                ph_real.push(ProgramHeader::new_load(
-                    start,
-                    end - start,
-                    false,
-                ));
+                ph_real.push(ProgramHeader::new_load(start, end - start, false));
             }
 
             if let Some((_, dyn_off, dyn_size)) =
